@@ -1,14 +1,38 @@
 const https = require('https');
 require('dotenv').config();
 
-function githubRequest(path) {
+// GitHub's unauthenticated rate limit is 60 req/h and triggers abuse-detection
+// almost immediately if requests fire back-to-back. A GITHUB_TOKEN (set in .env)
+// raises that to 5000 req/h; the throttle below keeps us under the ~1 req/s
+// secondary rate limit either way.
+const MIN_REQUEST_INTERVAL_MS = 1000;
+let nextRequestAt = 0;
+
+function throttle() {
+    const waitMs = Math.max(0, nextRequestAt - Date.now());
+    nextRequestAt = Date.now() + waitMs + MIN_REQUEST_INTERVAL_MS;
+    return new Promise(resolve => setTimeout(resolve, waitMs));
+}
+
+class GitHubRateLimitError extends Error {
+    constructor(message, retryAfterMs) {
+        super(message);
+        this.name = 'GitHubRateLimitError';
+        this.retryAfterMs = retryAfterMs;
+    }
+}
+
+async function githubRequest(path) {
+    await throttle();
+
     return new Promise((resolve, reject) => {
         const options = {
             hostname: 'api.github.com',
             path,
             headers: {
                 'User-Agent': 'mail-automation',
-                'Accept': 'application/vnd.github.v3+json'
+                'Accept': 'application/vnd.github.v3+json',
+                ...(process.env.GITHUB_TOKEN ? { 'Authorization': `token ${process.env.GITHUB_TOKEN}` } : {})
             }
         };
 
@@ -16,15 +40,33 @@ function githubRequest(path) {
             let data = '';
             res.on('data', chunk => (data += chunk));
             res.on('end', () => {
+                let parsed;
                 try {
-                    const parsed = JSON.parse(data);
-                    if (res.statusCode >= 400) {
-                        reject(new Error(`GitHub API ${res.statusCode}: ${parsed.message || data}`));
-                    } else {
-                        resolve(parsed);
-                    }
+                    parsed = JSON.parse(data);
                 } catch {
                     reject(new Error(`Failed to parse response: ${data}`));
+                    return;
+                }
+
+                if (res.statusCode === 403 || res.statusCode === 429) {
+                    const message = parsed.message || data;
+                    if (/rate limit|abuse detection/i.test(message)) {
+                        const retryAfterSec = Number(res.headers['retry-after']);
+                        const resetAt = Number(res.headers['x-ratelimit-reset']);
+                        const retryAfterMs = retryAfterSec
+                            ? retryAfterSec * 1000
+                            : resetAt
+                                ? Math.max(0, resetAt * 1000 - Date.now())
+                                : 60 * 1000;
+                        reject(new GitHubRateLimitError(`GitHub API ${res.statusCode}: ${message}`, retryAfterMs));
+                        return;
+                    }
+                }
+
+                if (res.statusCode >= 400) {
+                    reject(new Error(`GitHub API ${res.statusCode}: ${parsed.message || data}`));
+                } else {
+                    resolve(parsed);
                 }
             });
         }).on('error', reject);
@@ -94,7 +136,7 @@ async function getFollowerEmails(username) {
     return results;
 }
 
-module.exports = { getFollowerEmails, getEmailForUser, getFollowers };
+module.exports = { getFollowerEmails, getEmailForUser, getFollowers, GitHubRateLimitError };
 
 // Run directly: node githubFollowers.js <github-username>
 if (require.main === module) {
