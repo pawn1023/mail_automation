@@ -1,0 +1,6 @@
+node_modules/
+.env
+sent.json
+visited.json
+daily.json
+log.log
