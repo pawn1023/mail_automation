@@ -1,19 +1,45 @@
-// index.js  —  single sequential loop: find github id → extract mail → check new/old → send
-require('./logger'); // tee all console output to log.log
+// index.js — daily budget crawl: resume queue → top up seeds lightly → send until cap
+// Usage: node index.js usa | node index.js europe
+// Designed for NO GitHub token (60 core req/hour). Run once per day; state persists.
+require('./logger');
 const fs   = require('fs');
 const path = require('path');
-const { getFollowers, getEmailForUser, GitHubRateLimitError } = require('./githubFollowers');
-const { sendEmail } = require('./sendEmail');
+const {
+    getFollowers,
+    getEmailForUser,
+    getUserProfile,
+    discoverUsersByQueries,
+    GitHubRateLimitError,
+    HAS_TOKEN,
+    MIN_REQUEST_INTERVAL_MS,
+} = require('./githubFollowers');
+const { getRegion, matchesRegion, listRegionKeys } = require('./regions');
+const { loadAccounts } = require('./accounts');
+const { MailPool } = require('./mailPool');
 
-// ── Config ────────────────────────────────────────────────────────────────────
-const MAX_DEPTH        = 2;
-const SEND_DELAY_MIN_MS = 5 * 60 * 1000;
-const SEND_DELAY_MAX_MS = 8 * 60 * 1000;
-const LIMIT_SLEEP_MIN_MS = 11.5 * 60 * 60 * 1000; // ~12h, jittered
+// ── Config (daily / no-token friendly) ────────────────────────────────────────
+const MAX_DEPTH = 2;                 // shallow DFS — enough for daily 60 sends
+const SEARCH_PAGES_PER_QUERY = 1;    // 1 page (~100 users) per top-up
+const QUERIES_PER_TOPUP = 1;         // rotate 1 location query per top-up
+const QUEUE_REFILL_BELOW = 40;       // only search when queue is thin
+const MAX_FOLLOWERS_QUEUE = 20;      // don't dump 100 followers onto the stack
+const PER_ACCOUNT_SEND_LIMIT = 30;   // 30 × 2 accounts = 60 mails / run
+const SEND_DELAY_MIN_MS  = 5 * 60 * 1000;
+const SEND_DELAY_MAX_MS  = 8 * 60 * 1000;
+const LIMIT_SLEEP_MIN_MS = 11.5 * 60 * 60 * 1000;
 const LIMIT_SLEEP_MAX_MS = 12.5 * 60 * 60 * 1000;
 
-const SENT_FILE    = path.join(__dirname, 'sent.json');
-const VISITED_FILE = path.join(__dirname, 'visited.json');
+const SENT_FILE = path.join(__dirname, 'sent.json');
+
+function visitedFileFor(regionKey) {
+    return path.join(__dirname, `visited-${regionKey}.json`);
+}
+function queueFileFor(regionKey) {
+    return path.join(__dirname, `queue-${regionKey}.json`);
+}
+function searchStateFileFor(regionKey) {
+    return path.join(__dirname, `search-state-${regionKey}.json`);
+}
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 function loadSet(file) {
@@ -23,6 +49,38 @@ function loadSet(file) {
 
 function saveSet(file, set) {
     fs.writeFileSync(file, JSON.stringify([...set], null, 2));
+}
+
+function loadQueue(file) {
+    if (!fs.existsSync(file)) return [];
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return Array.isArray(data) ? data : [];
+}
+
+function saveQueue(file, stack) {
+    // Cap persisted queue size so the file stays manageable
+    const trimmed = stack.slice(-500);
+    fs.writeFileSync(file, JSON.stringify(trimmed, null, 2));
+}
+
+function loadSearchState(file, queryCount) {
+    const day = Math.floor(Date.now() / 86400000); // UTC day number
+    if (!fs.existsSync(file)) {
+        return { day, queryIndex: day % Math.max(queryCount, 1) };
+    }
+    try {
+        const s = JSON.parse(fs.readFileSync(file, 'utf8'));
+        return {
+            day: s.day ?? day,
+            queryIndex: typeof s.queryIndex === 'number' ? s.queryIndex : 0,
+        };
+    } catch {
+        return { day, queryIndex: 0 };
+    }
+}
+
+function saveSearchState(file, state) {
+    fs.writeFileSync(file, JSON.stringify(state, null, 2));
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -44,14 +102,6 @@ function randomLimitSleep() {
     return LIMIT_SLEEP_MIN_MS + Math.floor(Math.random() * (LIMIT_SLEEP_MAX_MS - LIMIT_SLEEP_MIN_MS));
 }
 
-// Gmail SMTP signals the daily sending quota via a 550/452 response mentioning the quota
-function isDailyLimitError(err) {
-    const text = `${err.responseCode ?? ''} ${err.response ?? ''} ${err.message ?? ''}`.toLowerCase();
-    return /daily user sending (quota|limit)|sending quota exceeded|too many messages/i.test(text);
-}
-
-// Runs a GitHub API call, and if it hits rate-limit/abuse-detection, sleeps for
-// as long as GitHub says to (Retry-After / X-RateLimit-Reset) and retries.
 async function withGithubRateLimitRetry(fn) {
     while (true) {
         try {
@@ -59,169 +109,276 @@ async function withGithubRateLimitRetry(fn) {
         } catch (err) {
             if (!(err instanceof GitHubRateLimitError)) throw err;
 
-            const waitMs = err.retryAfterMs + 5000; // small buffer past the reset
-            console.log(`[crawler] ⛔ ${err.message} — sleeping ${Math.round(waitMs / 1000)}s before retrying...`);
+            const waitMs = Math.max(err.retryAfterMs + 5000, 60 * 1000);
+            const mins = (waitMs / 60000).toFixed(1);
+            console.log(`[crawler] ⛔ ${err.message} — sleeping ${mins} min before retrying...`);
             await delay(waitMs);
             console.log('[crawler] ▶  resuming after rate limit sleep');
         }
     }
 }
 
-// Sends, but if Gmail reports the daily quota is hit, sleeps ~12h and retries the same email
-async function sendWithLimitRetry(email, subject, html) {
-    while (true) {
-        try {
-            return await sendEmail(email, subject, html);
-        } catch (err) {
-            if (!isDailyLimitError(err)) throw err;
-
-            const waitMs = randomLimitSleep();
-            console.log(`[sender]  ⛔ daily sending limit hit — sleeping ${(waitMs / 3600000).toFixed(1)}h before retrying ${email}...`);
-            await delay(waitMs);
-            console.log(`[sender]  ▶  resuming — retrying ${email}`);
-        }
+/**
+ * Top up the DFS stack only when thin.
+ * Rotates through region.searchQueries one query at a time (daily-friendly).
+ */
+async function maybeTopUpSeeds(region, stack, visitedUsers, searchStatePath) {
+    const pending = stack.filter(i => !visitedUsers.has(i.username)).length;
+    if (pending >= QUEUE_REFILL_BELOW) {
+        console.log(`[search] queue has ${pending} pending — skip search top-up`);
+        return;
     }
+
+    const queries = region.searchQueries;
+    const state = loadSearchState(searchStatePath, queries.length);
+    const today = Math.floor(Date.now() / 86400000);
+
+    // Advance rotation once per calendar day
+    if (state.day !== today) {
+        state.queryIndex = (state.queryIndex + 1) % queries.length;
+        state.day = today;
+        console.log(`[search] new day → rotate to query index ${state.queryIndex}`);
+    }
+
+    const batch = [];
+    for (let i = 0; i < QUERIES_PER_TOPUP; i++) {
+        const idx = (state.queryIndex + i) % queries.length;
+        batch.push(queries[idx]);
+    }
+    // Next top-up in the same day advances further if queue drains again
+    state.queryIndex = (state.queryIndex + QUERIES_PER_TOPUP) % queries.length;
+    saveSearchState(searchStatePath, state);
+
+    console.log(`[search] topping up with: ${batch.join(' | ')} (1 page each)`);
+
+    const seeds = await withGithubRateLimitRetry(() =>
+        discoverUsersByQueries(batch, {
+            maxPagesPerQuery: SEARCH_PAGES_PER_QUERY,
+            exclude: visitedUsers,
+            onPage: ({ query, page, count, totalCount }) => {
+                console.log(`[search] ${query} page ${page}: +${count} (total≈${totalCount})`);
+            },
+        })
+    );
+
+    const existing = new Set(stack.map(i => i.username));
+    let added = 0;
+    for (let i = seeds.length - 1; i >= 0; i--) {
+        const u = seeds[i];
+        if (visitedUsers.has(u) || existing.has(u)) continue;
+        stack.push({ username: u, depth: 0 });
+        existing.add(u);
+        added++;
+    }
+    console.log(`[search] ✅ added ${added} new seed(s); queue size ${stack.length}\n`);
 }
 
-// ── Main loop: crawl one user → get email → check new → send → delay → repeat ─
-async function run(seedUsername, subject, html) {
-    const sentEmails   = loadSet(SENT_FILE);
-    const visitedUsers = loadSet(VISITED_FILE);
+// ── Main ──────────────────────────────────────────────────────────────────────
+async function run(region, subject, html, mailPool) {
+    const visitedPath     = visitedFileFor(region.key);
+    const queuePath       = queueFileFor(region.key);
+    const searchStatePath = searchStateFileFor(region.key);
+    const sentEmails      = loadSet(SENT_FILE);
+    const visitedUsers    = loadSet(visitedPath);
+    const stack           = loadQueue(queuePath);
 
-    console.log(`Seed user     : ${seedUsername}`);
-    console.log(`Max depth     : ${MAX_DEPTH}`);
-    console.log(`Emails sent   : ${sentEmails.size} on record`);
-    console.log(`Users visited : ${visitedUsers.size} on record\n`);
+    console.log(`Mode          : daily budget (no GitHub token required)`);
+    console.log(`API pacing    : ${MIN_REQUEST_INTERVAL_MS / 1000}s between GitHub calls` +
+        (HAS_TOKEN ? ' (token detected)' : ' (unauthenticated 60/h)'));
+    console.log(`Region        : ${region.label}`);
+    console.log(`Traversal     : DFS depth≤${MAX_DEPTH}`);
+    console.log(`Mail accounts : ${mailPool.accounts.length}`);
+    console.log(`Per-account   : ${mailPool.perAccountLimit}/run (target ${mailPool.targetTotal()})`);
+    console.log(`Queue loaded  : ${stack.length}`);
+    console.log(`Already sent  : ${sentEmails.size}`);
+    console.log(`Already visited: ${visitedUsers.size}\n`);
 
-    let sent   = 0;
+    await maybeTopUpSeeds(region, stack, visitedUsers, searchStatePath);
+    saveQueue(queuePath, stack);
+
+    if (stack.length === 0) {
+        console.error('[search] queue empty and no new seeds — try again tomorrow (query rotates daily)');
+        return;
+    }
+
+    let sent = 0;
     let failed = 0;
-    const queue = [{ username: seedUsername, depth: 0 }];
+    let skippedLocation = 0;
+    let runComplete = false;
 
-    while (queue.length > 0) {
-        const { username, depth } = queue.shift();
+    const remainingSendsNeeded = () => mailPool.targetTotal() - mailPool.totalSentThisRun();
 
+    while (stack.length > 0) {
+        if (mailPool.isRunComplete()) {
+            runComplete = true;
+            break;
+        }
+
+        // If queue got thin mid-run and we still need sends, top up once more
+        const pending = stack.filter(i => !visitedUsers.has(i.username)).length;
+        if (pending < 10 && remainingSendsNeeded() > 0) {
+            await maybeTopUpSeeds(region, stack, visitedUsers, searchStatePath);
+            saveQueue(queuePath, stack);
+        }
+
+        const { username, depth } = stack.pop();
         if (visitedUsers.has(username)) continue;
 
-        console.log(`[crawler] depth ${depth} — ${username}`);
+        console.log(`[crawler] DFS depth ${depth} — ${username} (queue: ${stack.length})`);
 
-        // 1+2. Find github id (already have it) → extract mail from commit
+        let profile = null;
+        try {
+            profile = await withGithubRateLimitRetry(() => getUserProfile(username));
+        } catch (err) {
+            console.error(`[crawler] → error fetching profile for ${username}: ${err.message}`);
+        }
+
+        const profileLocation = profile?.location || null;
+        const inRegion = matchesRegion(profileLocation, region);
+        if (!inRegion) {
+            skippedLocation++;
+            console.log(`[crawler] → skip (location: ${profileLocation ?? 'n/a'} ≠ ${region.label})`);
+            visitedUsers.add(username);
+            saveSet(visitedPath, visitedUsers);
+            saveQueue(queuePath, stack);
+            continue;
+        }
+
+        console.log(`[crawler] → location OK: ${profileLocation}`);
+
         let email = null;
         try {
-            email = await withGithubRateLimitRetry(() => getEmailForUser(username));
+            // Reuse profile — saves one API call
+            email = await withGithubRateLimitRetry(() => getEmailForUser(username, profile));
         } catch (err) {
             console.error(`[crawler] → error getting email for ${username}: ${err.message}`);
         }
 
-        // 3. Check its new or old
         if (isRealEmail(email) && !sentEmails.has(email)) {
-            // 4. Send mail
             console.log(`[sender]  → sending to ${email}...`);
             try {
-                await sendWithLimitRetry(email, subject, html);
+                await mailPool.sendWithFailover(email, subject, html);
                 sentEmails.add(email);
                 saveSet(SENT_FILE, sentEmails);
                 sent++;
-                console.log(`[sender]  ✅ sent (total: ${sent})`);
+                console.log(`[sender]  ✅ sent (total this run: ${sent})`);
+
+                if (mailPool.isRunComplete()) {
+                    runComplete = true;
+                    visitedUsers.add(username);
+                    saveSet(visitedPath, visitedUsers);
+                    saveQueue(queuePath, stack);
+                    break;
+                }
 
                 const waitMs = randomSendDelay();
                 console.log(`[sender]  ⏳ waiting ${Math.round(waitMs / 1000)}s before next mail...`);
                 await delay(waitMs);
             } catch (err) {
+                if (err.code === 'RUN_COMPLETE') {
+                    runComplete = true;
+                    console.log(`[sender]  ${err.message}`);
+                    visitedUsers.add(username);
+                    saveSet(visitedPath, visitedUsers);
+                    saveQueue(queuePath, stack);
+                    break;
+                }
                 console.error(`[sender]  ❌ failed: ${err.message}`);
                 failed++;
             }
         } else if (email) {
-            console.log(`[crawler] → skipped ${email} (already sent)`);
+            console.log(`[crawler] → skipped ${email} (already sent or noreply)`);
+        } else {
+            console.log(`[crawler] → no public email for ${username}`);
         }
 
-        // Expand followers
-        if (depth < MAX_DEPTH) {
+        // Expand followers only if we still need more sends and queue isn't already fat
+        const needMore = remainingSendsNeeded() > 0 && !mailPool.isRunComplete();
+        if (needMore && depth < MAX_DEPTH && stack.length < QUEUE_REFILL_BELOW * 2) {
             try {
-                const followers = await withGithubRateLimitRetry(() => getFollowers(username));
-                for (const follower of followers) {
-                    if (!visitedUsers.has(follower)) {
-                        queue.push({ username: follower, depth: depth + 1 });
-                    }
+                const followers = await withGithubRateLimitRetry(() =>
+                    getFollowers(username, MAX_FOLLOWERS_QUEUE)
+                );
+                const existing = new Set(stack.map(i => i.username));
+                let queued = 0;
+                for (let i = Math.min(followers.length, MAX_FOLLOWERS_QUEUE) - 1; i >= 0; i--) {
+                    const follower = followers[i];
+                    if (visitedUsers.has(follower) || existing.has(follower)) continue;
+                    stack.push({ username: follower, depth: depth + 1 });
+                    queued++;
                 }
+                console.log(`[crawler] → queued ${queued} follower(s) for DFS`);
             } catch (err) {
                 console.error(`[crawler] → error fetching followers of ${username}: ${err.message}`);
             }
         }
 
-        // Only mark as visited once this user is fully processed — mirrors sent.json's
-        // "persist on success" so a crash mid-run doesn't permanently skip a half-done user.
         visitedUsers.add(username);
-        saveSet(VISITED_FILE, visitedUsers);
+        saveSet(visitedPath, visitedUsers);
+        saveQueue(queuePath, stack);
     }
 
-    console.log(`\n[done] sent: ${sent}, failed: ${failed}`);
+    saveQueue(queuePath, stack);
+
+    console.log(`\n[done] sent: ${sent}, failed: ${failed}, skipped(location): ${skippedLocation}`);
+    console.log(`[done] queue saved: ${stack.length} user(s) for next run`);
+    if (runComplete) {
+        console.log(`[done] daily cap reached (${mailPool.perAccountLimit} each) — stop until tomorrow`);
+        for (const a of mailPool.accounts) {
+            console.log(`  • ${a.email}: ${mailPool.sentCount(a.email)}/${mailPool.perAccountLimit}`);
+        }
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
-const seedUsername = process.argv[2];
-if (!seedUsername) {
-    console.error('Usage: node index.js <seed-github-username>');
+const regionArg = (process.argv[2] || '').toLowerCase();
+const region = getRegion(regionArg);
+
+if (!region) {
+    console.error(`Usage: node index.js <${listRegionKeys().join('|')}>`);
+    console.error('  node index.js usa      — USA developers only');
+    console.error('  node index.js europe   — Europe developers only');
     process.exit(1);
 }
 
-const SUBJECT = "Looking for Good Partner like you";
+let accounts;
+try {
+    accounts = loadAccounts(region.key);
+} catch (err) {
+    console.error(err.message);
+    process.exit(1);
+}
+
+const mailPool = new MailPool(accounts, {
+    delay,
+    randomLimitSleep,
+    perAccountLimit: PER_ACCOUNT_SEND_LIMIT,
+});
+
+const SUBJECT = "I'm looking for a long-term partner";
 const HTML = `
 <p>Hi,</p>
 
-<p>I'm Leo Lee from China, and I'm a Senior Full-Stack Web Developer.</p>
+<p>I'm looking for a long-term partner.</p>
 
-<p>I recently reviewed your GitHub repositories and was impressed by your techn>
+<p>After eight years working as a software engineer, I realized something about myself: I love building things, but I don't enjoy selling myself.</p>
 
-<p>As a software engineer, I have strong expertise in handling full-cycle devel>
+<p>Give me a difficult technical problem, a messy codebase, or a system that needs to be designed from scratch, and I can spend hours happily working on it. But put me in an HR interview, ask me to explain my value in a few minutes, or ask me to convince someone why an idea is worth pursuing, and suddenly I'm not playing my strongest game.</p>
 
-<p>Throughout my career, I have worked with local companies for many years, bui>
+<p>I've met many people who are the opposite. They might not want to spend their nights thinking about system architecture or debugging a difficult production issue, but they are naturally good at talking with people, understanding what others need, explaining ideas clearly, and building trust. And I think that's valuable.</p>
 
-<p>I can handle various software development tasks, including frontend engineer>
+<p>The problem is that the industry often expects one person to be everything at once: an excellent engineer, a great communicator, a salesperson, a leader, and a relationship builder. Those people exist, but they are rare.</p>
 
-<p>I have worked with local companies for a long time, but now I would like to >
+<p>I've started thinking that maybe the better approach is not trying to become someone I'm not. Maybe the better approach is finding someone whose strengths complete mine.</p>
 
-<p><strong>Why do I need to use a US account?</strong></p>
+<p>I'm looking for someone who enjoys the parts I struggle with: talking to clients, creating opportunities, building relationships, and communicating ideas. In return, I bring eight years of experience designing software, building systems, and turning ideas into working products.</p>
 
-<p>As you may know, developers from the US often have more opportunities on Fre>
+<p>I don't think great companies are built by people who are good at everything. I think they're built by people who know what they are good at and find others who complement them.</p>
 
-<p>Unfortunately, it is very challenging to compete for high-quality projects u>
-
-<p>Therefore, I would like to use a US account instead of my China-based accoun>
-
-<p><strong>How can I use your account?</strong></p>
-
-<p>If you already have a Freelancer.com account that you are not actively using>
-
-<p>If you do not have an account, you could create a new one for me. Another po>
-
-<p>I will only access and use the account during the agreed working periods and>
-
-<p><strong>How can we transfer money with each other?</strong></p>
-
-<p>You can connect your Payoneer or PayPal account to the Freelancer.com accoun>
-
-<p>After receiving the payment, you can keep your agreed commission and send th>
-
-<p><strong>Your Benefits:</strong> All payments will be received directly throu>
-
-<p><strong>Why do I need access to your local computer via TeamViewer or AnyDes>
-
-
-<p>Freelancer.com has advanced security systems that can detect unusual login l>
-
-<p>If you are concerned about your personal information or private files, you c>
-
-<p>I believe this could become a mutually beneficial collaboration opportunity,>
-
-<p>I'm looking forward to hearing from you.</p>
-
-<p>Thanks for your time and consideration.</p>
-
-<p>Best regards,<br>
-Leo Lee</p>
+<p>If you feel like you have the opposite problem - you're great with people and opportunities but need someone who can build - I would love to talk.</p>
 `;
 
-run(seedUsername, SUBJECT, HTML).catch(err => {
+run(region, SUBJECT, HTML, mailPool).catch(err => {
     console.error('Fatal:', err.message);
     process.exit(1);
 });

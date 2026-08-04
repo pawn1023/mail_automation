@@ -1,11 +1,11 @@
 const https = require('https');
 require('dotenv').config();
 
-// GitHub's unauthenticated rate limit is 60 req/h and triggers abuse-detection
-// almost immediately if requests fire back-to-back. A GITHUB_TOKEN (set in .env)
-// raises that to 5000 req/h; the throttle below keeps us under the ~1 req/s
-// secondary rate limit either way.
-const MIN_REQUEST_INTERVAL_MS = 1000;
+// No token → 60 core req/hour. Pace at ~1 req / 65s so we rarely hit 403.
+// With token → 5000/h; 1 req/s is enough for secondary limits.
+const HAS_TOKEN = Boolean(process.env.GITHUB_TOKEN);
+const MIN_REQUEST_INTERVAL_MS = HAS_TOKEN ? 1000 : 65 * 1000;
+
 let nextRequestAt = 0;
 
 function throttle() {
@@ -32,8 +32,8 @@ async function githubRequest(path) {
             headers: {
                 'User-Agent': 'mail-automation',
                 'Accept': 'application/vnd.github.v3+json',
-                ...(process.env.GITHUB_TOKEN ? { 'Authorization': `token ${process.env.GITHUB_TOKEN}` } : {})
-            }
+                ...(HAS_TOKEN ? { Authorization: `token ${process.env.GITHUB_TOKEN}` } : {}),
+            },
         };
 
         https.get(options, (res) => {
@@ -57,7 +57,7 @@ async function githubRequest(path) {
                             ? retryAfterSec * 1000
                             : resetAt
                                 ? Math.max(0, resetAt * 1000 - Date.now())
-                                : 60 * 1000;
+                                : 60 * 60 * 1000; // default 1h when unauthenticated
                         reject(new GitHubRateLimitError(`GitHub API ${res.statusCode}: ${message}`, retryAfterMs));
                         return;
                     }
@@ -73,88 +73,97 @@ async function githubRequest(path) {
     });
 }
 
-async function getFollowers(username) {
+async function getFollowers(username, perPage = 30) {
     console.log(`Fetching followers of "${username}"...`);
-    const followers = await githubRequest(`/users/${username}/followers?per_page=100`);
+    const followers = await githubRequest(`/users/${username}/followers?per_page=${perPage}`);
     const logins = followers.map(f => f.login);
-    return [...new Set(logins)]; // remove duplicates
+    return [...new Set(logins)];
 }
 
-async function getPublicRepos(username) {
-    const repos = await githubRequest(`/users/${username}/repos?per_page=10&sort=pushed`);
+async function getPublicRepos(username, perPage = 3) {
+    const repos = await githubRequest(`/users/${username}/repos?per_page=${perPage}&sort=pushed`);
     return repos.map(r => r.name);
 }
 
+/** Prefer list payload email — avoids a second commit-detail request. */
 async function getAuthorEmailFromRepo(owner, repo) {
-    // Step 1: get a commit SHA authored by the repo owner
     const commits = await githubRequest(`/repos/${owner}/${repo}/commits?author=${owner}&per_page=1`);
     if (!Array.isArray(commits) || commits.length === 0) return null;
-
-    const sha = commits[0].sha;
-    if (!sha) return null;
-
-    // Step 2: fetch full commit detail by SHA → commit.author.email is the real email
-    // https://api.github.com/repos/{owner}/{repo}/commits/{commit_sha}
-    const detail = await githubRequest(`/repos/${owner}/${repo}/commits/${sha}`);
-    return detail.commit?.author?.email ?? null;
+    return commits[0].commit?.author?.email ?? null;
 }
 
-async function getProfileEmail(username) {
-    const profile = await githubRequest(`/users/${username}`);
-    return profile.email ?? null;
+async function getUserProfile(username) {
+    return githubRequest(`/users/${username}`);
 }
 
-async function getEmailForUser(username) {
-    // 1. Try commit author email from repos
-    const repos = await getPublicRepos(username);
+/**
+ * Cheap email lookup. Pass an already-fetched profile to skip a duplicate /users call.
+ * Order: profile.email → up to 3 recent repos (1 API call each).
+ */
+async function getEmailForUser(username, profile = null) {
+    if (profile?.email) return profile.email;
+
+    if (!profile) {
+        try {
+            profile = await getUserProfile(username);
+            if (profile.email) return profile.email;
+        } catch {
+            // fall through to repos
+        }
+    }
+
+    const repos = await getPublicRepos(username, 3);
     for (const repo of repos) {
         const email = await getAuthorEmailFromRepo(username, repo);
         if (email) return email;
     }
-
-    // 2. Fall back to public profile email
-    return await getProfileEmail(username);
+    return null;
 }
 
-async function getFollowerEmails(username) {
-    const followers = await getFollowers(username);
-    console.log(`Found ${followers.length} follower(s)\n`);
+async function searchUsers(query, page = 1, perPage = 100) {
+    const q = encodeURIComponent(query);
+    const data = await githubRequest(`/search/users?q=${q}&per_page=${perPage}&page=${page}`);
+    const items = Array.isArray(data.items) ? data.items : [];
+    return {
+        logins: items.map((u) => u.login).filter(Boolean),
+        totalCount: data.total_count ?? 0,
+    };
+}
 
-    const results = [];
+/**
+ * Run several location queries and collect unique logins.
+ */
+async function discoverUsersByQueries(queries, options = {}) {
+    const maxPagesPerQuery = options.maxPagesPerQuery ?? 1;
+    const seen = new Set(options.exclude || []);
+    const logins = [];
 
-    for (const follower of followers) {
-        try {
-            const email = await getEmailForUser(follower);
-            results.push({ username: follower, email });
-            console.log(`  ${follower}: ${email ?? '(no email found)'}`);
-        } catch (err) {
-            console.error(`  ${follower}: error — ${err.message}`);
-            results.push({ username: follower, email: null });
+    for (const query of queries) {
+        for (let page = 1; page <= maxPagesPerQuery; page++) {
+            const { logins: pageLogins, totalCount } = await searchUsers(query, page);
+            if (options.onPage) options.onPage({ query, page, count: pageLogins.length, totalCount });
+
+            for (const login of pageLogins) {
+                if (!seen.has(login)) {
+                    seen.add(login);
+                    logins.push(login);
+                }
+            }
+
+            if (pageLogins.length === 0 || page * 100 >= Math.min(totalCount, 1000)) break;
         }
     }
 
-    return results;
+    return logins;
 }
 
-module.exports = { getFollowerEmails, getEmailForUser, getFollowers, GitHubRateLimitError };
-
-// Run directly: node githubFollowers.js <github-username>
-if (require.main === module) {
-    const targetUser = process.argv[2];
-    if (!targetUser) {
-        console.error('Usage: node githubFollowers.js <github-username>');
-        process.exit(1);
-    }
-
-    getFollowerEmails(targetUser).then(results => {
-        const withEmail = results.filter(r => r.email);
-        console.log(`\n=== Summary ===`);
-        console.log(`Total followers: ${results.length}`);
-        console.log(`Emails found:    ${withEmail.length}`);
-        console.log('\n--- Emails ---');
-        withEmail.forEach(r => console.log(`${r.username}: ${r.email}`));
-    }).catch(err => {
-        console.error('Fatal:', err.message);
-        process.exit(1);
-    });
-}
+module.exports = {
+    getEmailForUser,
+    getFollowers,
+    getUserProfile,
+    searchUsers,
+    discoverUsersByQueries,
+    GitHubRateLimitError,
+    HAS_TOKEN,
+    MIN_REQUEST_INTERVAL_MS,
+};

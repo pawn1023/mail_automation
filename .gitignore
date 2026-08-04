@@ -1,6 +1,10 @@
 node_modules/
 .env
+accounts.json
 sent.json
 visited.json
+visited-*.json
+queue-*.json
+search-state-*.json
 daily.json
 log.log

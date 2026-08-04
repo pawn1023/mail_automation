@@ -1,0 +1,22 @@
+[
+  {
+    "email": "usa1@gmail.com",
+    "pass": "xxxx xxxx xxxx xxxx",
+    "region": "usa"
+  },
+  {
+    "email": "usa2@gmail.com",
+    "pass": "yyyyyyyyyyyyyyyy",
+    "region": "usa"
+  },
+  {
+    "email": "europe1@gmail.com",
+    "pass": "zzzz zzzz zzzz zzzz",
+    "region": "europe"
+  },
+  {
+    "email": "europe2@gmail.com",
+    "pass": "wwwwwwwwwwwwwwww",
+    "region": "europe"
+  }
+]
