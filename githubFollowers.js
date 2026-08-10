@@ -85,6 +85,21 @@ async function getPublicRepos(username, perPage = 3) {
     return repos.map(r => r.name);
 }
 
+/** Full repo objects (name, fork, language, stars, description, url) — used to pick a repo to mention in the email. */
+async function getOwnerRepos(username, perPage = 6) {
+    const repos = await githubRequest(`/users/${username}/repos?per_page=${perPage}&sort=pushed&type=owner`);
+    if (!Array.isArray(repos)) return [];
+    return repos.map(r => ({
+        name: r.name,
+        fork: Boolean(r.fork),
+        archived: Boolean(r.archived),
+        language: r.language || null,
+        stargazers_count: r.stargazers_count || 0,
+        description: r.description || null,
+        html_url: r.html_url || null,
+    }));
+}
+
 /** Prefer list payload email — avoids a second commit-detail request. */
 async function getAuthorEmailFromRepo(owner, repo) {
     const commits = await githubRequest(`/repos/${owner}/${repo}/commits?author=${owner}&per_page=1`);
@@ -97,10 +112,10 @@ async function getUserProfile(username) {
 }
 
 /**
- * Cheap email lookup. Pass an already-fetched profile to skip a duplicate /users call.
- * Order: profile.email → up to 3 recent repos (1 API call each).
+ * Cheap email lookup. Pass an already-fetched profile (and/or repos, from getOwnerRepos)
+ * to skip duplicate API calls. Order: profile.email → up to 3 non-fork repos (1 API call each).
  */
-async function getEmailForUser(username, profile = null) {
+async function getEmailForUser(username, profile = null, repos = null) {
     if (profile?.email) return profile.email;
 
     if (!profile) {
@@ -112,9 +127,12 @@ async function getEmailForUser(username, profile = null) {
         }
     }
 
-    const repos = await getPublicRepos(username, 3);
-    for (const repo of repos) {
-        const email = await getAuthorEmailFromRepo(username, repo);
+    if (!repos) {
+        repos = await getOwnerRepos(username, 3);
+    }
+    const candidates = repos.filter(r => r && r.name && !r.fork).slice(0, 3);
+    for (const repo of candidates) {
+        const email = await getAuthorEmailFromRepo(username, repo.name);
         if (email) return email;
     }
     return null;
@@ -161,6 +179,8 @@ module.exports = {
     getEmailForUser,
     getFollowers,
     getUserProfile,
+    getPublicRepos,
+    getOwnerRepos,
     searchUsers,
     discoverUsersByQueries,
     GitHubRateLimitError,
