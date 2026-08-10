@@ -26,9 +26,7 @@ const SEARCH_PAGES_PER_QUERY = 1;    // 1 page (~100 users) per top-up
 const QUERIES_PER_TOPUP = 1;         // rotate 1 location query per top-up
 const QUEUE_REFILL_BELOW = 40;       // only search when queue is thin
 const MAX_FOLLOWERS_QUEUE = 20;      // don't dump 100 followers onto the stack
-const PER_ACCOUNT_SEND_LIMIT = 30;   // 30 × 2 accounts = 60 mails / run
-const SEND_DELAY_MIN_MS  = 5 * 60 * 1000;
-const SEND_DELAY_MAX_MS  = 8 * 60 * 1000;
+const PER_ACCOUNT_SEND_LIMIT = 30;   // 30 × accounts.length mails / run
 const LIMIT_SLEEP_MIN_MS = 11.5 * 60 * 60 * 1000;
 const LIMIT_SLEEP_MAX_MS = 12.5 * 60 * 60 * 1000;
 
@@ -95,10 +93,6 @@ function isRealEmail(email) {
 
 function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function randomSendDelay() {
-    return SEND_DELAY_MIN_MS + Math.floor(Math.random() * (SEND_DELAY_MAX_MS - SEND_DELAY_MIN_MS));
 }
 
 function randomLimitSleep() {
@@ -282,10 +276,6 @@ async function run(region, mailPool) {
                     saveQueue(queuePath, stack);
                     break;
                 }
-
-                const waitMs = randomSendDelay();
-                console.log(`[sender]  ⏳ waiting ${Math.round(waitMs / 1000)}s before next mail...`);
-                await delay(waitMs);
             } catch (err) {
                 if (err.code === 'RUN_COMPLETE') {
                     runComplete = true;
