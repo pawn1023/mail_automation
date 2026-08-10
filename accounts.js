@@ -14,14 +14,17 @@ function validateAccount(raw, index) {
     const email  = (raw.email || raw.user || raw.mail || '').trim();
     const pass   = normalizePass(raw.pass || raw.password || raw.key || raw.appPassword);
     const region = (raw.region || '').trim().toLowerCase() || null;
+    const host   = raw.host ? String(raw.host).trim() : undefined;
+    const port   = raw.port !== undefined ? Number(raw.port) : undefined;
+    const secure = raw.secure !== undefined ? Boolean(raw.secure) : undefined;
 
     if (!email || !pass) {
         throw new Error(`Account #${index + 1}: missing email or pass`);
     }
-    if (pass.length !== 16) {
+    if (email.endsWith('@gmail.com') && pass.length !== 16) {
         console.warn(`[accounts] ⚠  ${email}: app password length is ${pass.length} (expected 16) — check for typos`);
     }
-    return { email, pass, region };
+    return { email, pass, region, host, port, secure };
 }
 
 function loadFromEnv() {
