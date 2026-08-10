@@ -1,16 +1,31 @@
 const https = require('https');
 require('dotenv').config();
 
-// No token → 60 core req/hour. Pace at ~1 req / 65s so we rarely hit 403.
-// With token → 5000/h; 1 req/s is enough for secondary limits.
+// Core endpoints (users/repos/commits): unauth 60 req/h, auth 5000 req/h.
+// Search endpoint has its own, much stricter limit: unauth 10 req/min, auth 30 req/min.
+// Stay a bit under each ceiling so normal jitter doesn't trip secondary abuse detection.
 const HAS_TOKEN = Boolean(process.env.GITHUB_TOKEN);
-const MIN_REQUEST_INTERVAL_MS = HAS_TOKEN ? 1000 : 65 * 1000;
+const MIN_REQUEST_INTERVAL_MS = HAS_TOKEN ? 750 : 65 * 1000;       // auth: ~4800/h < 5000/h cap
+const SEARCH_MIN_REQUEST_INTERVAL_MS = HAS_TOKEN ? 2100 : 6500;    // auth: ~28/min < 30/min cap
 
 let nextRequestAt = 0;
+let nextSearchRequestAt = 0;
 
-function throttle() {
-    const waitMs = Math.max(0, nextRequestAt - Date.now());
-    nextRequestAt = Date.now() + waitMs + MIN_REQUEST_INTERVAL_MS;
+// If GitHub reports we're running low on quota, push the next request out to the reset time
+// instead of waiting to get hit with a 403.
+let coolDownUntil = 0;
+
+function throttleCore() {
+    const base = Math.max(Date.now(), nextRequestAt, coolDownUntil);
+    const waitMs = Math.max(0, base - Date.now());
+    nextRequestAt = base + MIN_REQUEST_INTERVAL_MS;
+    return new Promise(resolve => setTimeout(resolve, waitMs));
+}
+
+function throttleSearch() {
+    const base = Math.max(Date.now(), nextSearchRequestAt, coolDownUntil);
+    const waitMs = Math.max(0, base - Date.now());
+    nextSearchRequestAt = base + SEARCH_MIN_REQUEST_INTERVAL_MS;
     return new Promise(resolve => setTimeout(resolve, waitMs));
 }
 
@@ -23,7 +38,8 @@ class GitHubRateLimitError extends Error {
 }
 
 async function githubRequest(path) {
-    await throttle();
+    const isSearch = path.startsWith('/search/');
+    await (isSearch ? throttleSearch() : throttleCore());
 
     return new Promise((resolve, reject) => {
         const options = {
@@ -40,6 +56,14 @@ async function githubRequest(path) {
             let data = '';
             res.on('data', chunk => (data += chunk));
             res.on('end', () => {
+                // Running low on quota (e.g. shared with other tools using the same token)?
+                // Cool down until reset instead of racing the limit down to a 403.
+                const remaining = Number(res.headers['x-ratelimit-remaining']);
+                const resetAt = Number(res.headers['x-ratelimit-reset']);
+                if (Number.isFinite(remaining) && remaining <= 3 && Number.isFinite(resetAt)) {
+                    coolDownUntil = Math.max(coolDownUntil, resetAt * 1000);
+                }
+
                 let parsed;
                 try {
                     parsed = JSON.parse(data);
