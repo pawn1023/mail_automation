@@ -12,6 +12,13 @@ function isAuthError(err) {
     return code === 535 || code === 534 || /invalid login|username and password not accepted|authentication failed|badcredentials/i.test(text);
 }
 
+/** Network/handshake hiccup — not the recipient's or account's fault, safe to retry elsewhere. */
+function isTransientNetworkError(err) {
+    const netCodes = new Set(['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ESOCKET', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN']);
+    if (netCodes.has(err.code)) return true;
+    return /connection timeout|greeting never received|socket close|timed out/i.test(err.message ?? '');
+}
+
 class MailPool {
     /**
      * @param {Array<{ email: string, pass: string }>} accounts
@@ -105,6 +112,9 @@ class MailPool {
      * On daily limit → mark exhausted, try next; if all daily-limited but not capped → sleep ~12h.
      */
     async sendWithFailover(to, subject, html) {
+        const maxTransientRetries = this.accounts.length;
+        let transientRetries = 0;
+
         while (true) {
             if (this.isRunComplete()) {
                 const err = new Error(
@@ -163,6 +173,16 @@ class MailPool {
                     console.log(
                         `[sender]  ⛔ daily limit on ${account.email} — ` +
                         `switching account (${this.usableCount()} left)`
+                    );
+                    this.index = (this.index + 1) % this.accounts.length;
+                    continue;
+                }
+
+                if (isTransientNetworkError(err) && transientRetries < maxTransientRetries) {
+                    transientRetries++;
+                    console.log(
+                        `[sender]  ⚠  network error on ${account.email} (${err.message}) — ` +
+                        `retrying ${to} on next account (${transientRetries}/${maxTransientRetries})`
                     );
                     this.index = (this.index + 1) % this.accounts.length;
                     continue;
