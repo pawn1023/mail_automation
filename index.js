@@ -260,7 +260,7 @@ async function run(region, mailPool) {
 
         if (isRealEmail(email) && !sentEmails.has(email)) {
             const repo = pickSuitableRepo(repos);
-            const { subject, html } = buildEmail(username, profile, repo);
+            const { subject, html } = buildEmail(username, profile, repo, repos);
             console.log(`[sender]  → sending to ${email}${repo ? ` (repo: "${repo.name}")` : ''}...`);
             try {
                 await mailPool.sendWithFailover(email, subject, html);

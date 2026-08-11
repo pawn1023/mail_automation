@@ -38,4 +38,32 @@ function pickSuitableRepo(repos) {
     };
 }
 
-module.exports = { pickSuitableRepo, cleanRepoName };
+/**
+ * Up to 2 non-noisy languages across the user's best non-fork/non-archived repos,
+ * ordered by stars (same candidate set as pickSuitableRepo). Ported from
+ * Email send workflow/backend/app/services/content.py::_langs, but sourced
+ * directly from repo objects instead of a stored CSV string.
+ */
+const NOISY_LANGUAGE = new Set(['jupyter notebook', 'html', 'css', 'shell', 'makefile', 'dockerfile']);
+
+function repoLanguages(repos) {
+    if (!Array.isArray(repos) || repos.length === 0) return [];
+
+    const candidates = repos
+        .filter(r => r && r.name && !r.fork && !r.archived)
+        .map(r => ({ ...r, cleanName: cleanRepoName(r.name) }))
+        .filter(r => r.cleanName);
+
+    candidates.sort((a, b) => (b.stargazers_count || 0) - (a.stargazers_count || 0));
+
+    const langs = [];
+    for (const r of candidates) {
+        const lang = r.language && r.language.trim();
+        if (!lang || NOISY_LANGUAGE.has(lang.toLowerCase())) continue;
+        if (!langs.includes(lang)) langs.push(lang);
+        if (langs.length >= 2) break;
+    }
+    return langs;
+}
+
+module.exports = { pickSuitableRepo, cleanRepoName, repoLanguages };
