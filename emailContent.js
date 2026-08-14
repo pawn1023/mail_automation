@@ -5,7 +5,7 @@
 // No LLM involved — this mirrors the workflow app's approach exactly, just re-hosted in JS.
 
 const crypto = require('crypto');
-const { cleanRepoName, repoLanguages } = require('./repoPicker');
+const { cleanRepoName, repoLanguages, languagesFromBreakdown } = require('./repoPicker');
 
 const CLOSING = 'Looking forward to hearing from you.\n\nBest Regards,';
 
@@ -193,14 +193,17 @@ function escapeHtml(str) {
  * @param {string} username - GitHub login
  * @param {object|null} profile - GitHub /users/:username response
  * @param {{name, language, description, url}|null} topRepo - from repoPicker.pickSuitableRepo
- * @param {Array<object>|null} repos - full repo list, for language signal (repoPicker.repoLanguages)
+ * @param {Array<object>|null} repos - full repo list, fallback language signal
+ * @param {Array<{name, bytes, pct}>|object|null} langBreakdown - from GET /repos/.../languages
  * @returns {{ subject: string, html: string }}
  */
-function buildEmail(username, profile, topRepo, repos) {
+function buildEmail(username, profile, topRepo, repos, langBreakdown = null) {
     const rng = rngFor(username);
     const profileUrlStr = profileUrl(username, profile?.html_url);
     const repo = topRepo ? cleanRepoName(topRepo.name) : null;
-    const langs = repoLanguages(repos || []);
+    // Prefer sidebar languages for the picked repo; fall back to list-API primary langs
+    let langs = languagesFromBreakdown(langBreakdown || []);
+    if (!langs.length) langs = repoLanguages(repos || []);
     const bio = profile?.bio || null;
     const portfolio = profile?.blog || null;
 

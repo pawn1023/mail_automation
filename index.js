@@ -9,6 +9,7 @@ const {
     getEmailForUser,
     getUserProfile,
     getOwnerRepos,
+    getRepoLanguages,
     discoverUsersByQueries,
     GitHubRateLimitError,
     HAS_TOKEN,
@@ -260,7 +261,26 @@ async function run(region, mailPool) {
 
         if (isRealEmail(email) && !sentEmails.has(email)) {
             const repo = pickSuitableRepo(repos);
-            const { subject, html } = buildEmail(username, profile, repo, repos);
+            // Sidebar languages for the picked repo (GET /repos/{owner}/{repo}/languages)
+            let langBreakdown = null;
+            if (repo) {
+                try {
+                    langBreakdown = await withGithubRateLimitRetry(() =>
+                        getRepoLanguages(username, repo.apiName || repo.name)
+                    );
+                    if (langBreakdown[0]) {
+                        repo.language = langBreakdown[0].name;
+                    }
+                    const preview = langBreakdown
+                        .slice(0, 3)
+                        .map(l => `${l.name} ${l.pct.toFixed(1)}%`)
+                        .join(', ');
+                    console.log(`[crawler] → languages (${repo.name}): ${preview || 'none'}`);
+                } catch (err) {
+                    console.error(`[crawler] → error fetching languages for ${repo.name}: ${err.message}`);
+                }
+            }
+            const { subject, html } = buildEmail(username, profile, repo, repos, langBreakdown);
             console.log(`[sender]  → sending to ${email}${repo ? ` (repo: "${repo.name}")` : ''}...`);
             try {
                 await mailPool.sendWithFailover(email, subject, html);

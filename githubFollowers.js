@@ -124,6 +124,29 @@ async function getOwnerRepos(username, perPage = 6) {
     }));
 }
 
+/**
+ * GET /repos/{owner}/{repo}/languages — same breakdown as the GitHub sidebar.
+ * Values are byte counts; percentages are derived locally.
+ * @returns {Promise<Array<{ name: string, bytes: number, pct: number }>>} sorted by bytes desc
+ */
+async function getRepoLanguages(owner, repo) {
+    const data = await githubRequest(`/repos/${owner}/${repo}/languages`);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return [];
+
+    const entries = Object.entries(data).filter(
+        ([, bytes]) => typeof bytes === 'number' && bytes > 0
+    );
+    const total = entries.reduce((sum, [, b]) => sum + b, 0) || 1;
+
+    return entries
+        .map(([name, bytes]) => ({
+            name,
+            bytes,
+            pct: (bytes / total) * 100,
+        }))
+        .sort((a, b) => b.bytes - a.bytes);
+}
+
 /** Prefer list payload email — avoids a second commit-detail request. */
 async function getAuthorEmailFromRepo(owner, repo) {
     const commits = await githubRequest(`/repos/${owner}/${repo}/commits?author=${owner}&per_page=1`);
@@ -205,6 +228,7 @@ module.exports = {
     getUserProfile,
     getPublicRepos,
     getOwnerRepos,
+    getRepoLanguages,
     searchUsers,
     discoverUsersByQueries,
     GitHubRateLimitError,

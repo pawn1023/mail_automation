@@ -32,6 +32,7 @@ function pickSuitableRepo(repos) {
 
     return {
         name: top.cleanName,
+        apiName: top.name, // original GitHub name for API calls
         language: top.language || null,
         description: top.description || null,
         url: top.html_url || null,
@@ -40,11 +41,37 @@ function pickSuitableRepo(repos) {
 
 /**
  * Up to 2 non-noisy languages across the user's best non-fork/non-archived repos,
- * ordered by stars (same candidate set as pickSuitableRepo). Ported from
- * Email send workflow/backend/app/services/content.py::_langs, but sourced
- * directly from repo objects instead of a stored CSV string.
+ * ordered by stars (same candidate set as pickSuitableRepo). Fallback when the
+ * /languages endpoint was not fetched. Prefer languagesFromBreakdown when available.
  */
 const NOISY_LANGUAGE = new Set(['jupyter notebook', 'html', 'css', 'shell', 'makefile', 'dockerfile']);
+
+/**
+ * From GET /repos/{owner}/{repo}/languages (byte map or sorted {name,bytes,pct}[]),
+ * return up to `max` non-noisy language names by byte count — same signal as the sidebar.
+ */
+function languagesFromBreakdown(breakdown, max = 2) {
+    let entries = [];
+    if (Array.isArray(breakdown)) {
+        entries = breakdown
+            .map((x) => (typeof x === 'string' ? { name: x, bytes: 0 } : x))
+            .filter((x) => x && x.name);
+    } else if (breakdown && typeof breakdown === 'object') {
+        entries = Object.entries(breakdown)
+            .filter(([, bytes]) => typeof bytes === 'number' && bytes > 0)
+            .map(([name, bytes]) => ({ name, bytes }));
+        entries.sort((a, b) => b.bytes - a.bytes);
+    }
+
+    const langs = [];
+    for (const e of entries) {
+        const lang = String(e.name).trim();
+        if (!lang || NOISY_LANGUAGE.has(lang.toLowerCase())) continue;
+        if (!langs.includes(lang)) langs.push(lang);
+        if (langs.length >= max) break;
+    }
+    return langs;
+}
 
 function repoLanguages(repos) {
     if (!Array.isArray(repos) || repos.length === 0) return [];
@@ -66,4 +93,4 @@ function repoLanguages(repos) {
     return langs;
 }
 
-module.exports = { pickSuitableRepo, cleanRepoName, repoLanguages };
+module.exports = { pickSuitableRepo, cleanRepoName, repoLanguages, languagesFromBreakdown };
