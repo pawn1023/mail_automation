@@ -1,7 +1,8 @@
 // index.js — daily budget crawl: resume queue → top up seeds lightly → send until cap
-// Usage: node index.js usa | node index.js europe
+// Usage: node index.js usa | node index.js europe [dailyLimit]
 // Designed for NO GitHub token (60 core req/hour). Run once per day; state persists.
 require('./logger');
+require('dotenv').config();
 const fs   = require('fs');
 const path = require('path');
 const {
@@ -20,16 +21,15 @@ const { loadAccounts } = require('./accounts');
 const { MailPool } = require('./mailPool');
 const { pickSuitableRepo } = require('./repoPicker');
 const { buildEmail } = require('./emailContent');
+const { waitUntilSendTime, todayKeyInZone } = require('./schedule');
+const { getDailySendLimit } = require('./config');
 
 // ── Config (daily / no-token friendly) ────────────────────────────────────────
-const MAX_DEPTH = 2;                 // shallow DFS — enough for daily 60 sends
+const MAX_DEPTH = 2;                 // shallow DFS — enough for daily sends
 const SEARCH_PAGES_PER_QUERY = 1;    // 1 page (~100 users) per top-up
 const QUERIES_PER_TOPUP = 1;         // rotate 1 location query per top-up
 const QUEUE_REFILL_BELOW = 40;       // only search when queue is thin
 const MAX_FOLLOWERS_QUEUE = 20;      // don't dump 100 followers onto the stack
-const PER_ACCOUNT_SEND_LIMIT = 30;   // 30 × accounts.length mails / run
-const LIMIT_SLEEP_MIN_MS = 11.5 * 60 * 60 * 1000;
-const LIMIT_SLEEP_MAX_MS = 12.5 * 60 * 60 * 1000;
 
 const SENT_FILE = path.join(__dirname, 'sent.json');
 
@@ -41,6 +41,9 @@ function queueFileFor(regionKey) {
 }
 function searchStateFileFor(regionKey) {
     return path.join(__dirname, `search-state-${regionKey}.json`);
+}
+function dailyCountFileFor(regionKey) {
+    return path.join(__dirname, `daily-count-${regionKey}.json`);
 }
 
 // ── Persistence ───────────────────────────────────────────────────────────────
@@ -85,6 +88,22 @@ function saveSearchState(file, state) {
     fs.writeFileSync(file, JSON.stringify(state, null, 2));
 }
 
+function loadDailyCount(file, timeZone) {
+    const today = todayKeyInZone(timeZone);
+    if (!fs.existsSync(file)) return { day: today, count: 0 };
+    try {
+        const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (data.day !== today) return { day: today, count: 0 };
+        return { day: today, count: Number(data.count) || 0 };
+    } catch {
+        return { day: today, count: 0 };
+    }
+}
+
+function saveDailyCount(file, state) {
+    fs.writeFileSync(file, JSON.stringify(state, null, 2));
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function isRealEmail(email) {
     if (!email) return false;
@@ -94,10 +113,6 @@ function isRealEmail(email) {
 
 function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function randomLimitSleep() {
-    return LIMIT_SLEEP_MIN_MS + Math.floor(Math.random() * (LIMIT_SLEEP_MAX_MS - LIMIT_SLEEP_MIN_MS));
 }
 
 async function withGithubRateLimitRetry(fn) {
@@ -172,24 +187,35 @@ async function maybeTopUpSeeds(region, stack, visitedUsers, searchStatePath) {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
-async function run(region, mailPool) {
+async function run(region, mailPool, dailySendLimit) {
     const visitedPath     = visitedFileFor(region.key);
     const queuePath       = queueFileFor(region.key);
     const searchStatePath = searchStateFileFor(region.key);
+    const dailyCountPath  = dailyCountFileFor(region.key);
     const sentEmails      = loadSet(SENT_FILE);
     const visitedUsers    = loadSet(visitedPath);
     const stack           = loadQueue(queuePath);
+    const dailyState      = loadDailyCount(dailyCountPath, region.timeZone);
 
     console.log(`Mode          : daily budget (no GitHub token required)`);
     console.log(`API pacing    : ${MIN_REQUEST_INTERVAL_MS / 1000}s between GitHub calls` +
         (HAS_TOKEN ? ' (token detected)' : ' (unauthenticated 60/h)'));
     console.log(`Region        : ${region.label}`);
+    console.log(`Send window   : ${String(region.sendHour).padStart(2, '0')}:00 ${region.timeZone}`);
+    console.log(`Daily cap     : ${dailySendLimit} mails (${dailyState.count} already sent on ${dailyState.day})`);
     console.log(`Traversal     : DFS depth≤${MAX_DEPTH}`);
     console.log(`Mail accounts : ${mailPool.accounts.length}`);
-    console.log(`Per-account   : ${mailPool.perAccountLimit}/run (target ${mailPool.targetTotal()})`);
+    console.log(`Run target    : ${mailPool.targetTotal()} mail(s) this session`);
     console.log(`Queue loaded  : ${stack.length}`);
     console.log(`Already sent  : ${sentEmails.size}`);
     console.log(`Already visited: ${visitedUsers.size}\n`);
+
+    if (dailyState.count >= dailySendLimit) {
+        console.log(`[schedule] daily cap already reached for ${region.label} — nothing to do until tomorrow`);
+        return;
+    }
+
+    await waitUntilSendTime(region.timeZone, region.sendHour, delay);
 
     await maybeTopUpSeeds(region, stack, visitedUsers, searchStatePath);
     saveQueue(queuePath, stack);
@@ -286,6 +312,8 @@ async function run(region, mailPool) {
                 await mailPool.sendWithFailover(email, subject, html);
                 sentEmails.add(email);
                 saveSet(SENT_FILE, sentEmails);
+                dailyState.count++;
+                saveDailyCount(dailyCountPath, dailyState);
                 sent++;
                 console.log(`[sender]  ✅ sent (total this run: ${sent})`);
 
@@ -345,21 +373,33 @@ async function run(region, mailPool) {
     console.log(`\n[done] sent: ${sent}, failed: ${failed}, skipped(location): ${skippedLocation}`);
     console.log(`[done] queue saved: ${stack.length} user(s) for next run`);
     if (runComplete) {
-        console.log(`[done] daily cap reached (${mailPool.perAccountLimit} each) — stop until tomorrow`);
+        console.log(`[done] daily cap reached (${mailPool.totalSentThisRun()}/${dailySendLimit}) — stop until tomorrow`);
         for (const a of mailPool.accounts) {
-            console.log(`  • ${a.email}: ${mailPool.sentCount(a.email)}/${mailPool.perAccountLimit}`);
+            console.log(`  • ${a.email}: ${mailPool.sentCount(a.email)} sent this run`);
         }
     }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 const regionArg = (process.argv[2] || '').toLowerCase();
+const limitArg = process.argv[3];
 const region = getRegion(regionArg);
 
 if (!region) {
-    console.error(`Usage: node index.js <${listRegionKeys().join('|')}>`);
-    console.error('  node index.js usa      — USA developers only');
-    console.error('  node index.js europe   — Europe developers only');
+    console.error(`Usage: node index.js <${listRegionKeys().join('|')}> [dailyLimit]`);
+    console.error('  node index.js usa           — USA developers only');
+    console.error('  node index.js europe        — Europe developers only');
+    console.error('  node index.js usa 50        — override daily cap for this run');
+    console.error('');
+    console.error('Daily limit priority: CLI arg → DAILY_SEND_LIMIT_<REGION> → regions.js → DAILY_SEND_LIMIT → 30');
+    process.exit(1);
+}
+
+let dailySendLimit;
+try {
+    dailySendLimit = getDailySendLimit(region.key, limitArg);
+} catch (err) {
+    console.error(err.message);
     process.exit(1);
 }
 
@@ -371,13 +411,14 @@ try {
     process.exit(1);
 }
 
+const dailyState = loadDailyCount(dailyCountFileFor(region.key), region.timeZone);
+const remainingToday = Math.max(0, dailySendLimit - dailyState.count);
+
 const mailPool = new MailPool(accounts, {
-    delay,
-    randomLimitSleep,
-    perAccountLimit: PER_ACCOUNT_SEND_LIMIT,
+    runLimit: remainingToday,
 });
 
-run(region, mailPool).catch(err => {
+run(region, mailPool, dailySendLimit).catch(err => {
     console.error('Fatal:', err.message);
     process.exit(1);
 });

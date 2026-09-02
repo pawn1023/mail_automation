@@ -6,5 +6,6 @@ visited.json
 visited-*.json
 queue-*.json
 search-state-*.json
+daily-count-*.json
 daily.json
 log.log

@@ -5,6 +5,9 @@ const REGIONS = {
     usa: {
         key: 'usa',
         label: 'USA',
+        timeZone: 'America/New_York',
+        sendHour: 8,
+        dailySendLimit: 30, // optional — override with DAILY_SEND_LIMIT_USA or CLI
         // Queries fed to GitHub Search API (type:user implied by /search/users)
         searchQueries: [
             'location:"United States"',
@@ -36,6 +39,9 @@ const REGIONS = {
     europe: {
         key: 'europe',
         label: 'Europe',
+        timeZone: 'Europe/Berlin',
+        sendHour: 8,
+        dailySendLimit: 30, // optional — override with DAILY_SEND_LIMIT_EUROPE or CLI
         searchQueries: [
             'location:Germany',
             'location:France',

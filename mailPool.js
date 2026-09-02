@@ -1,4 +1,4 @@
-// mailPool.js — rotate across Gmail accounts; per-run cap + daily quota / bad auth failover
+// mailPool.js — rotate across Gmail accounts; daily run cap + SMTP quota / bad auth failover
 const { sendEmail } = require('./sendEmail');
 
 function isDailyLimitError(err) {
@@ -22,20 +22,16 @@ function isTransientNetworkError(err) {
 class MailPool {
     /**
      * @param {Array<{ email: string, pass: string }>} accounts
-     * @param {{ delay: (ms: number) => Promise<void>, randomLimitSleep: () => number, perAccountLimit?: number }} helpers
+     * @param {{ delay?: (ms: number) => Promise<void>, runLimit?: number }} helpers
      */
     constructor(accounts, helpers) {
         if (!accounts?.length) throw new Error('MailPool: need at least one account');
         this.accounts = accounts;
-        this.delay = helpers.delay;
-        this.randomLimitSleep = helpers.randomLimitSleep;
-        this.perAccountLimit = helpers.perAccountLimit ?? 30;
+        this.runLimit = helpers.runLimit ?? 30;
         this.index = 0;
         /** @type {Map<string, number>} sends this run per account */
         this.sentCounts = new Map(accounts.map(a => [a.email, 0]));
-        /** @type {Set<string>} hit per-run cap */
-        this.capped = new Set();
-        /** @type {Set<string>} emails that hit daily quota this cycle */
+        /** @type {Set<string>} emails that hit provider daily quota this cycle */
         this.exhausted = new Set();
         /** @type {Set<string>} emails with bad credentials — skip permanently this run */
         this.dead = new Set();
@@ -56,22 +52,51 @@ class MailPool {
     }
 
     targetTotal() {
-        return this.accounts.length * this.perAccountLimit;
+        return this.runLimit;
     }
 
-    /** True when every account is capped, dead, or otherwise unusable for this run. */
+    remainingSends() {
+        return Math.max(0, this.runLimit - this.totalSentThisRun());
+    }
+
+    /** True when daily run cap is hit or every account is dead / provider-exhausted. */
     isRunComplete() {
+        if (this.totalSentThisRun() >= this.runLimit) return true;
         return this.accounts.every(
-            a => this.capped.has(a.email) || this.dead.has(a.email)
+            a => this.dead.has(a.email) || this.exhausted.has(a.email)
         );
+    }
+
+    allAccountsProviderLimited() {
+        return this.accounts.length > 0 && this.accounts.every(a => this.exhausted.has(a.email));
+    }
+
+    allAccountsDead() {
+        return this.accounts.length > 0 && this.accounts.every(a => this.dead.has(a.email));
+    }
+
+    runCompleteError() {
+        const err = new Error('Run complete');
+        err.code = 'RUN_COMPLETE';
+
+        if (this.totalSentThisRun() >= this.runLimit) {
+            err.message =
+                `Run complete: daily cap of ${this.runLimit} reached ` +
+                `(${this.totalSentThisRun()}/${this.runLimit})`;
+        } else if (this.allAccountsProviderLimited()) {
+            err.message =
+                'Run complete: all accounts hit Google daily sending limit — stop until tomorrow';
+        } else if (this.allAccountsDead()) {
+            err.message = 'Run complete: all accounts failed authentication';
+        } else {
+            err.message = 'Run complete: no usable mail accounts left for today';
+        }
+
+        return err;
     }
 
     isAvailable(acc) {
-        return (
-            !this.exhausted.has(acc.email) &&
-            !this.dead.has(acc.email) &&
-            !this.capped.has(acc.email)
-        );
+        return !this.exhausted.has(acc.email) && !this.dead.has(acc.email);
     }
 
     /** Next account that can still send; null if none left right now. */
@@ -95,21 +120,19 @@ class MailPool {
     recordSend(account) {
         const next = this.sentCount(account.email) + 1;
         this.sentCounts.set(account.email, next);
+        const total = this.totalSentThisRun();
         console.log(
-            `[sender]  📊 ${account.email}: ${next}/${this.perAccountLimit} this run ` +
-            `(pool ${this.totalSentThisRun()}/${this.targetTotal()})`
+            `[sender]  📊 ${account.email}: ${next} this run ` +
+            `(pool ${total}/${this.runLimit})`
         );
-        if (next >= this.perAccountLimit) {
-            this.capped.add(account.email);
-            console.log(`[sender]  ✅ ${account.email} reached ${this.perAccountLimit} mails — done for this run`);
+        if (total >= this.runLimit) {
+            console.log(`[sender]  ✅ daily cap reached (${this.runLimit} mails) — done for today`);
         }
     }
 
     /**
      * Send using an available account.
-     * Stops the run (throws RunCompleteError conceptually via return null path) when all accounts
-     * hit their per-run cap — caller should check isRunComplete().
-     * On daily limit → mark exhausted, try next; if all daily-limited but not capped → sleep ~12h.
+     * Stops when runLimit is hit, all accounts hit Google daily limit, or all accounts fail auth.
      */
     async sendWithFailover(to, subject, html) {
         const maxTransientRetries = this.accounts.length;
@@ -117,47 +140,22 @@ class MailPool {
 
         while (true) {
             if (this.isRunComplete()) {
-                const err = new Error(
-                    `Run complete: each account reached ${this.perAccountLimit} sends ` +
-                    `(${this.totalSentThisRun()}/${this.targetTotal()})`
-                );
-                err.code = 'RUN_COMPLETE';
-                throw err;
+                throw this.runCompleteError();
             }
 
             const account = this.pickAvailable();
-
             if (!account) {
-                // All capped or dead already handled above; remaining case = daily exhausted
-                const allDeadOrCapped = this.accounts.every(
-                    a => this.dead.has(a.email) || this.capped.has(a.email)
-                );
-                if (allDeadOrCapped) {
-                    const err = new Error('No usable mail accounts left for this run');
-                    err.code = 'RUN_COMPLETE';
-                    throw err;
-                }
-
-                const waitMs = this.randomLimitSleep();
-                console.log(
-                    `[sender]  ⛔ all remaining account(s) hit daily limit — ` +
-                    `sleeping ${(waitMs / 3600000).toFixed(1)}h before retrying ${to}...`
-                );
-                await this.delay(waitMs);
-                this.exhausted.clear();
-                this.index = 0;
-                console.log(`[sender]  ▶  quota reset — resuming`);
-                continue;
+                throw this.runCompleteError();
             }
 
             try {
                 console.log(
                     `[sender]  → using ${account.email} ` +
-                    `(${this.sentCount(account.email)}/${this.perAccountLimit}, ${this.usableCount()} usable)`
+                    `(${this.sentCount(account.email)} sent, ${this.usableCount()} usable, ` +
+                    `${this.remainingSends()} left today)`
                 );
                 const info = await sendEmail(to, subject, html, account);
                 this.recordSend(account);
-                // Round-robin to next account after a successful send
                 this.index = (this.index + 1) % this.accounts.length;
                 return info;
             } catch (err) {
@@ -171,10 +169,14 @@ class MailPool {
                 if (isDailyLimitError(err)) {
                     this.exhausted.add(account.email);
                     console.log(
-                        `[sender]  ⛔ daily limit on ${account.email} — ` +
+                        `[sender]  ⛔ Google daily limit on ${account.email} — ` +
                         `switching account (${this.usableCount()} left)`
                     );
                     this.index = (this.index + 1) % this.accounts.length;
+                    if (this.allAccountsProviderLimited()) {
+                        console.log('[sender]  ⛔ all accounts limited by Google — stopping for today');
+                        throw this.runCompleteError();
+                    }
                     continue;
                 }
 
