@@ -1,5 +1,7 @@
 // index.js — daily budget crawl: resume queue → top up seeds lightly → send until cap
-// Usage: node index.js usa | node index.js europe [dailyLimit]
+// Usage: node index.js [all|usa|europe] [dailyLimit]
+//   all (default) — wait for any region's 8:00 AM, then send for ready regions
+//   usa / europe  — single region only
 // Designed for NO GitHub token (60 core req/hour). Run once per day; state persists.
 require('./logger');
 require('dotenv').config();
@@ -16,12 +18,12 @@ const {
     HAS_TOKEN,
     MIN_REQUEST_INTERVAL_MS,
 } = require('./githubFollowers');
-const { getRegion, matchesRegion, listRegionKeys } = require('./regions');
+const { getRegion, matchesRegion, listRegionKeys, getAllRegions } = require('./regions');
 const { loadAccounts } = require('./accounts');
 const { MailPool } = require('./mailPool');
 const { pickSuitableRepo } = require('./repoPicker');
 const { buildEmail } = require('./emailContent');
-const { waitUntilSendTime, todayKeyInZone } = require('./schedule');
+const { waitUntilSendTime, waitUntilAnyRegionSendTime, msUntilSendTime, todayKeyInZone } = require('./schedule');
 const { getDailySendLimit } = require('./config');
 
 // ── Config (daily / no-token friendly) ────────────────────────────────────────
@@ -380,45 +382,101 @@ async function run(region, mailPool, dailySendLimit) {
     }
 }
 
+async function startRegion(region, limitArg) {
+    let dailySendLimit;
+    try {
+        dailySendLimit = getDailySendLimit(region.key, limitArg);
+    } catch (err) {
+        console.error(`[${region.key}] ${err.message}`);
+        return;
+    }
+
+    let accounts;
+    try {
+        accounts = loadAccounts(region.key);
+    } catch (err) {
+        console.error(`[${region.key}] ${err.message}`);
+        return;
+    }
+
+    const dailyState = loadDailyCount(dailyCountFileFor(region.key), region.timeZone);
+    const remainingToday = Math.max(0, dailySendLimit - dailyState.count);
+
+    if (remainingToday === 0) {
+        console.log(`[${region.key}] daily cap already reached — skip`);
+        return;
+    }
+
+    const mailPool = new MailPool(accounts, { runLimit: remainingToday });
+    await run(region, mailPool, dailySendLimit);
+}
+
+/** Run every region when its local time hits 8:00 AM (or later same day if not done). */
+async function runAllRegions(limitArg) {
+    const regions = getAllRegions();
+
+    console.log(`Mode          : multi-region scheduler`);
+    console.log(`Regions       : ${regions.map(r => `${r.label} (${r.timeZone} @ ${String(r.sendHour).padStart(2, '0')}:00)`).join(', ')}\n`);
+
+    while (true) {
+        const pending = regions.filter(region => {
+            const dailySendLimit = getDailySendLimit(region.key, limitArg);
+            const dailyState = loadDailyCount(dailyCountFileFor(region.key), region.timeZone);
+            return dailyState.count < dailySendLimit;
+        });
+
+        if (pending.length === 0) {
+            console.log('[schedule] all regions reached daily cap — done for today');
+            return;
+        }
+
+        const ready = pending.filter(
+            region => msUntilSendTime(region.timeZone, region.sendHour ?? 8, 0) === 0
+        );
+
+        if (ready.length === 0) {
+            await waitUntilAnyRegionSendTime(pending, delay);
+            continue;
+        }
+
+        for (const region of ready) {
+            console.log(`\n${'='.repeat(60)}`);
+            console.log(`[schedule] ▶  ${region.label} send window — starting run`);
+            console.log('='.repeat(60));
+            await startRegion(region, limitArg);
+        }
+
+        // Brief pause so we don't immediately re-enter the same send window
+        await delay(60_000);
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
-const regionArg = (process.argv[2] || '').toLowerCase();
+const regionArg = (process.argv[2] || 'all').toLowerCase();
 const limitArg = process.argv[3];
-const region = getRegion(regionArg);
 
-if (!region) {
-    console.error(`Usage: node index.js <${listRegionKeys().join('|')}> [dailyLimit]`);
-    console.error('  node index.js usa           — USA developers only');
-    console.error('  node index.js europe        — Europe developers only');
-    console.error('  node index.js usa 50        — override daily cap for this run');
-    console.error('');
-    console.error('Daily limit priority: CLI arg → DAILY_SEND_LIMIT_<REGION> → regions.js → DAILY_SEND_LIMIT → 30');
-    process.exit(1);
+if (regionArg === 'all') {
+    runAllRegions(limitArg).catch(err => {
+        console.error('Fatal:', err.message);
+        process.exit(1);
+    });
+} else {
+    const region = getRegion(regionArg);
+
+    if (!region) {
+        console.error(`Usage: node index.js [all|${listRegionKeys().join('|')}] [dailyLimit]`);
+        console.error('  node index.js             — all regions (default)');
+        console.error('  node index.js all         — wait for any region 8:00 AM, send when ready');
+        console.error('  node index.js usa         — USA only');
+        console.error('  node index.js europe      — Europe only');
+        console.error('  node index.js usa 50      — override daily cap for this run');
+        console.error('');
+        console.error('Daily limit priority: CLI arg → DAILY_SEND_LIMIT_<REGION> → regions.js → DAILY_SEND_LIMIT → 30');
+        process.exit(1);
+    }
+
+    startRegion(region, limitArg).catch(err => {
+        console.error('Fatal:', err.message);
+        process.exit(1);
+    });
 }
-
-let dailySendLimit;
-try {
-    dailySendLimit = getDailySendLimit(region.key, limitArg);
-} catch (err) {
-    console.error(err.message);
-    process.exit(1);
-}
-
-let accounts;
-try {
-    accounts = loadAccounts(region.key);
-} catch (err) {
-    console.error(err.message);
-    process.exit(1);
-}
-
-const dailyState = loadDailyCount(dailyCountFileFor(region.key), region.timeZone);
-const remainingToday = Math.max(0, dailySendLimit - dailyState.count);
-
-const mailPool = new MailPool(accounts, {
-    runLimit: remainingToday,
-});
-
-run(region, mailPool, dailySendLimit).catch(err => {
-    console.error('Fatal:', err.message);
-    process.exit(1);
-});

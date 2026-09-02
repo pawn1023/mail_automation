@@ -92,4 +92,8 @@ function listRegionKeys() {
     return Object.keys(REGIONS);
 }
 
-module.exports = { REGIONS, getRegion, matchesRegion, listRegionKeys };
+function getAllRegions() {
+    return listRegionKeys().map(key => REGIONS[key]);
+}
+
+module.exports = { REGIONS, getRegion, getAllRegions, matchesRegion, listRegionKeys };
